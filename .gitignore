@@ -10,6 +10,8 @@ __pycache__/
 .env
 local.json
 
-# Generated output, but not the artwork that goes into it.
+# Generated output, but not the artwork that goes into it, nor the fallback
+# image that ships to the Kindle.
 *.png
 !cat/*.png
+!kindle/weather/*.png

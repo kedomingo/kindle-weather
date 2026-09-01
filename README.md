@@ -1,35 +1,15 @@
-# weather-display, Orange Pi Zero 3 edition
+# weather-display
 
-Generates the Kindle weather image from [Open-Meteo](https://open-meteo.com/),
-with the display built around one question: *what do I need to know before I
+Turns a jailbroken Kindle into a wall weather display. A small always-on server
+on your LAN — anything that runs Python 3.9 and Pillow — renders a PNG from
+[Open-Meteo](https://open-meteo.com/) every fifteen minutes and serves it; the
+Kindle fetches it on a cron job and blits it to the panel.
+
+Everything for both halves is in this repo: the server side at the top level,
+the Kindle side in [`kindle/`](kindle).
+
+The display is built around one question: *what do I need to know before I
 leave the house?*
-
-Differences from the original `server/`:
-
-| | original | this |
-|---|---|---|
-| data | Yahoo Weather (YQL, dead since 2019) | Open-Meteo, no API key |
-| drawing | SVG template → ImageMagick → pngcrush | Pillow, direct to PNG |
-| deps | `imagemagick`, `pngcrush`, `myql`, `dom`, Python 2 | `Pillow`, Python 3.9+ |
-| content | current temp, wind, humidity, sunrise/sunset | min/max plus timed advisories |
-
-## No, you don't need ImageMagick
-
-The old pipeline existed only to turn an SVG into a grayscale PNG. Pillow does
-that in one step, so `imagemagick`, `pngcrush`, the font-config dance in the
-original README, and `template.svg` are all gone.
-
-pngcrush is also unnecessary. The renderer posterises to the 16 grey levels the
-Kindle panel can actually display, which is both closer to what you'll see and
-very compressible: output lands around **12–20 KB**, comparable to what
-pngcrush produced. Verified output format is exactly what `eips -f -g` wants:
-
-```
-PNG image data, 600 x 800, 8-bit grayscale, non-interlaced
-```
-
-The whole install is `apt install python3-pil fonts-dejavu-core`. On an Orange
-Pi Zero 3 that is a few seconds and no compiler.
 
 ## What it shows
 
@@ -60,53 +40,183 @@ Bars are the hourly chance of rain. **Solid** means rain is actually forecast;
 **hollow** means it's only a probability. The two thick marks on the axis are
 your commute windows.
 
-### The cat
+Drawing is Pillow and nothing else. The renderer posterises to the 16 grey
+levels the panel can actually display, which keeps output at 12–20 KB in exactly
+the format `eips -f -g` wants:
 
-The left column holds a random PNG from `cat/`, picked fresh on every render.
-It is pure decoration and every failure in it is swallowed — a missing
-directory or an unreadable file costs you the cat, never the weather.
+```
+PNG image data, 600 x 800, 8-bit grayscale, non-interlaced
+```
 
-Two things happen to each image on the way in. Its transparent margin is
-trimmed first, so cats of different shapes (one stretching, one scratching) each
-fill the column by their own proportions instead of by the padding in their
-square canvas. Then it is flattened onto white *before* dropping to 8-bit grey:
-converting RGBA straight to `"L"` reads fully transparent pixels as black and
-boxes the cat in.
+## Installation
 
-Drop your own PNGs in `cat/` and they join the rotation. `.gitignore` ignores
-generated `*.png` but re-includes `cat/*.png`, so artwork is tracked and output
-is not.
+Two machines, two schedules, and they are independent: the server renders the
+PNG on a timer, the Kindle fetches and draws it on its own cron job.
 
-Making room for this is what moved the day's high and low up into the header,
-which in turn freed the space above the bars for the weather icons. The whole
-vertical budget is named at the top of `render.py` (`BODY_LIMIT`, `CHART_RULE`,
-`ICON_ROW`, `BAR_TOP` …) so it can be audited in one place rather than chased
-through magic numbers.
+### 1. The server
 
-## The calendar
+Any Linux box on the LAN will do — a spare SBC, a NAS, a VM. It needs Python
+3.9+, Pillow and a font; there is nothing to compile.
 
-Under the advisories sit today's next couple of events. Finished ones are
-dropped — at 3pm a reminder about the 9am standup is just noise — so the band
-empties out as the day goes.
+```sh
+git clone https://github.com/kedomingo/kindle-weather.git weather-display
+cd weather-display
 
-The cheapest way in, and the default, is a **public calendar read as `.ics`**.
-Make a secondary calendar in Google Calendar, put on it only the events you
-want on the wall, set it to public, and put its ID in `.env`:
+sudo apt install python3-pil python3-dotenv fonts-dejavu-core
+
+sudo useradd --system --home /var/lib/weather-display weather
+sudo mkdir -p /opt/weather-display /etc/weather-display /var/lib/weather-display/www
+# cat/ too: cat_dir is resolved against the script, so it must travel with it.
+sudo cp -r *.py cat /opt/weather-display/
+sudo cp config.example.json /etc/weather-display/config.json
+sudo install -o root -g weather -m 640 .env.example /opt/weather-display/.env
+sudo chown -R weather:weather /var/lib/weather-display
+```
+
+Set your city and coordinates, and point `output` at the directory the web
+server serves:
+
+```sh
+sudoedit /etc/weather-display/config.json
+```
+
+```json
+{
+  "city": "Berlin",
+  "latitude": 52.52437,
+  "longitude": 13.41053,
+  "timezone": "Europe/Berlin",
+  "output": "/var/lib/weather-display/www/weather-script-output.png",
+  "cache":  "/var/lib/weather-display/last-forecast.json"
+}
+```
+
+Then start the renderer, its timer, and the file server:
+
+```sh
+sudo cp systemd/* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now weather-display.timer weather-http.service
+sudo systemctl start weather-display.service     # render one now
+journalctl -u weather-display.service -n 20
+```
+
+`weather-http.service` is `python3 -m http.server` bound to the LAN on port
+8080 — no nginx needed for one Kindle fetching one PNG. If you already run a
+web server, drop that unit and point `output` into its document root instead.
+Allow the port if there's a firewall:
+
+```sh
+sudo ufw allow from 192.168.0.0/16 to any port 8080 proto tcp
+```
+
+Confirm `http://<server>:8080/weather-script-output.png` loads from another
+machine before moving on, and give the server a static DHCP lease so that URL
+keeps working.
+
+<details>
+<summary>No systemd? Use cron instead.</summary>
+
+```cron
+*/15 * * * * /usr/bin/python3 /opt/weather-display/weather.py --config /etc/weather-display/config.json >> /var/log/weather-display.log 2>&1
+```
+
+Install it for the `weather` user: `sudo crontab -u weather -e`. Use absolute
+paths for both the interpreter and the script — cron's `PATH` is nearly empty —
+and keep the redirect, or every stderr line becomes mail you never read. From a
+virtualenv, name its interpreter directly (`/path/to/venv/bin/python3`) rather
+than activating anything. The working directory doesn't matter: `.env` is read
+from beside `weather.py`, and `output` and `cache` are absolute anyway.
+</details>
+
+### 2. Calendar events (optional)
+
+Under the advisories sit today's next couple of events. The cheapest way in,
+and the default, is a **public calendar read as `.ics`** — no Cloud project, no
+API key, no OAuth, nothing that expires.
+
+Make a secondary calendar in Google Calendar, put on it only the events you want
+on the wall, set it to public, and put its ID in `.env` beside `weather.py`:
+
+```sh
+sudoedit /opt/weather-display/.env
+```
 
 ```sh
 CALENDAR_ID=…@group.calendar.google.com
 ```
 
-That's the whole setup. No Cloud project, no API key, no OAuth, nothing that
-expires. You can paste the `?cid=…` share link Google hands you instead of the
-ID — it carries the ID base64'd inside it, and `gcal.py` decodes it.
+You can paste the `?cid=…` share link Google hands you instead of the ID — it
+carries the ID base64'd inside it, and `gcal.py` decodes it. With no
+`CALENDAR_ID` set the band is simply not drawn. See
+[The calendar](#the-calendar) for private calendars and the trade-offs.
 
-Everything calendar-shaped lives in `.env` rather than in the JSON config, so
-the config file stays safe to commit. `.env` is read from beside `weather.py`
-at startup, real environment variables take precedence over it (handy for a
-one-off `CALENDAR_ID=… ./weather.py`), and `.gitignore` covers it. Start from
-`.env.example`; the JSON config keeps only `max_events`, which is a display
-choice rather than a credential.
+### 3. The Kindle
+
+`kindle/` mirrors the Kindle's own filesystem, so installing it is a copy.
+Mount the jailbroken Kindle over USB and put its contents at the root of the
+`/mnt/us` volume — the drive that appears when you plug it in:
+
+```
+kindle/WIFI_NO_NET_PROBE               ->  /mnt/us/WIFI_NO_NET_PROBE
+kindle/weather/display-weather.sh      ->  /mnt/us/weather/display-weather.sh
+kindle/weather/weather-image-error.png ->  /mnt/us/weather/weather-image-error.png
+```
+
+Set `HOST` at the top of `display-weather.sh` to your server, then give the
+Kindle a cron job — it has no systemd, so this one really is cron:
+
+```cron
+2,17,32,47 * * * * /mnt/us/weather/display-weather.sh
+```
+
+Under busybox crond that is `crontab -e`, though on many jailbroken models it is
+backed by `/etc/crontab/root`; either way the rootfs is mounted read-only, so
+`mntroot rw` first if you edit outside `/mnt/us`. The two-minute offset has the
+Kindle fetch just after a fresh render rather than racing one.
+
+What each file does:
+
+- **`display-weather.sh`** stops the reader UI (`stop framework`), disables the
+  screensaver and the Pillow overlay, fetches the PNG, and draws it with
+  `eips -f -g`. A failed fetch waits 60s, retries once, and falls back to the
+  error image. Nothing restarts `framework` — the Kindle stays a dumb display
+  until you reboot it, which is the point.
+- **`weather-image-error.png`** is what you see when the server is unreachable.
+  It is 600x800, so replace it if your panel is a different size.
+- **`WIFI_NO_NET_PROBE`** is an empty marker that stops the Kindle testing for
+  real internet before it trusts a network. Without it a LAN-only setup can have
+  its wifi dropped as "no connection". If wifi still drops, try it as an empty
+  *directory* of that name instead — guides differ, and both forms are in
+  circulation.
+
+If your Kindle is newer than a Paperwhite 1, read
+[Newer Kindles](#newer-kindles) before you start.
+
+## Configuration
+
+All keys are optional; defaults are in `DEFAULTS` at the top of `weather.py`.
+
+| key | default | meaning |
+|---|---|---|
+| `city` | `Manila` | shown in the header |
+| `latitude`, `longitude` | Manila | forecast location |
+| `timezone` | `Asia/Manila` | an [IANA name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones); all times shown are local to this |
+| `output` | `weather-script-output.png` | where the PNG is written, atomically |
+| `cache` | `last-forecast.json` | last good payload, for offline fallback |
+| `display_units` | `metric` | `imperial` switches to °F and mph |
+| `width`, `height` | `800`, `600` | canvas before rotation; see [Newer Kindles](#newer-kindles) before changing |
+| `rotate` | `90` | degrees clockwise; `0` gives the landscape original |
+| `day_start_hour`, `day_end_hour` | `6`, `21` | hours that can produce an advisory |
+| `commutes` | `[[7,9],[17,19]]` | hour ranges that score higher |
+| `max_advisories` | `3` | lines of advice |
+| `greys` | `16` | grey levels; `0` disables posterising |
+| `cat_dir` | `./cat` | a random `.png` from here fills the left column; `null` for none |
+| `calendar` | `null` | `{"max_events": 2}`; the ID itself goes in `.env` — see [The calendar](#the-calendar) |
+| `fonts` | DejaVu, auto-detected | `{"regular": "...", "bold": "..."}` |
+
+Everything calendar-shaped lives in `.env` rather than in this file, so the
+config stays safe to commit:
 
 | variable | for |
 |---|---|
@@ -116,41 +226,47 @@ choice rather than a credential.
 | `CALENDAR_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | only for a private calendar |
 | `CALENDAR_ICS_URL` | a non-Google `.ics` feed, instead of a calendar ID |
 
-With no `CALENDAR_ID` set, the band is simply not drawn — and `--dry-run` says
-so, since an empty band otherwise looks identical to a broken one.
+`.env` is read from beside `weather.py` — `/opt/weather-display`, which is also
+the service's `WorkingDirectory`, so it is found either way. Mode `640`,
+`root:weather`, because it may hold a refresh token. Real environment variables
+take precedence over it, which makes a one-off `CALENDAR_ID=… ./weather.py`
+work, and `.gitignore` covers it.
 
-The catch is the obvious one: public means public. Anyone holding that ID can
-read every title and time on the calendar, so keep it curated and put nothing on
-it you would mind a stranger reading.
+### Where the image ends up
 
-The feed arrives unexpanded, so recurrence is worked out locally by `ics.py`:
-`DAILY`, `WEEKLY` (with `BYDAY`), `MONTHLY` and `YEARLY`, plus `INTERVAL`,
-`COUNT`, `UNTIL`, `WKST`, `EXDATE`, and single instances that were moved or
-cancelled.
-A rule outside that set shows up only on its first date, which errs towards too
-little on the panel rather than towards a wrong date.
+Wherever `output` points, and nowhere else:
 
-Two alternatives, if you need them:
-
-| you want | set in `.env` | cost |
+| running | `output` | the PNG lands |
 |---|---|---|
-| the same public calendar, but Google expands recurrence | `CALENDAR_API_KEY` + `CALENDAR_ID` | a Cloud project and an API key |
-| a **private** calendar | `CALENDAR_CLIENT_ID`, `_SECRET`, `_REFRESH_TOKEN` | one-time consent via `gcal_setup.py` |
+| by hand, from the repo | `preview.png` | in whatever directory you ran from |
+| on the server | `/var/lib/weather-display/www/weather-script-output.png` | served at `http://<server>:8080/weather-script-output.png` |
 
-A static API key only ever reaches public data, so the third row is the only way
-to read a private calendar. Watch its consent screen: an **External** app left
-in **Testing** is issued refresh tokens that expire after 7 days, and the
-symptom is a band that goes blank every week for no reason. Set it to **In
-production**.
+A relative path really does follow the working directory, so use an absolute one
+on the server, where systemd or cron picks the cwd rather than you. Two
+constraints on it: the **filename** must stay `weather-script-output.png`,
+because that is what the Kindle script asks for, and the **directory** must be
+the one `weather-http.service` serves. Missing directories are created.
 
-The API itself is free either way — a million requests a day per project, no
-billing account — and a render every half hour uses about 48. (Maps Platform is
-the opposite deal, which is where the worry usually comes from: it requires
-billing but does accept a static key.)
+## Running it by hand
 
-Whichever route, the calendar is strictly an extra. A Google outage, a bad key
-or an expired token is caught, logged to stderr, and falls back to the events
-cached from the last successful render; the weather draws regardless.
+```sh
+./weather.py --dry-run                    # print the summary, draw nothing
+./weather.py --config config.json         # normal run
+./weather.py --output /tmp/preview.png    # override the destination
+./weather.py --fixture saved.json         # render a saved API payload
+```
+
+`--dry-run` needs no Pillow, which makes it a quick way to sanity-check
+thresholds over SSH:
+
+```
+Manila  Mon 31 Aug 20:07
+  high 31°  low 26°
+  Rain on and off
+  - Light rain 6am-12pm - bring an umbrella   (rain, severity 55)
+  - Thunderstorms 8-9am - stay indoors if you can   (thunder, severity 100)
+  - Strong gusts at 3pm, 71 km/h - an umbrella will flip   (wind, severity 65)
+```
 
 ## The advisory rules
 
@@ -178,6 +294,9 @@ to or from work win, and they pick up the umbrella advice.
 | wind | gusts ≥40 / ≥60 km/h | `Strong gusts at 5pm, 71 km/h - an umbrella will flip` |
 | fog | weather code 45/48 | `Fog 6-8am - slower traffic` |
 | uv | UV index ≥9 | `Very high UV 10am-3pm - sunscreen` |
+
+Thresholds live at the top of `advisor.py`. They're always metric even when the
+display is in Fahrenheit, so you can retune them without thinking about units.
 
 ### Black ice
 
@@ -254,128 +373,81 @@ Three details that took some care:
 - **`snow_depth` is in metres** while `snowfall` is in centimetres. Easy to mix
   up when tuning thresholds.
 
-Thresholds live at the top of `advisor.py`. They're always metric even when the
-display is in Fahrenheit, so you can retune them without thinking about units.
+## The calendar
 
-## Install on the Orange Pi Zero 3
+Finished events are dropped — at 3pm a reminder about the 9am standup is just
+noise — so the band empties out as the day goes. `--dry-run` says when the band
+is off, since an empty band otherwise looks identical to a broken one.
 
-```sh
-sudo apt install python3-pil python3-dotenv fonts-dejavu-core
+The catch with the public-calendar default is the obvious one: public means
+public. Anyone holding that ID can read every title and time on the calendar, so
+keep it curated and put nothing on it you would mind a stranger reading.
 
-sudo useradd --system --home /var/lib/weather-display weather
-sudo mkdir -p /opt/weather-display /etc/weather-display /var/lib/weather-display/www
-sudo cp *.py /opt/weather-display/
-sudo cp config.example.json /etc/weather-display/config.json
-sudo chown -R weather:weather /var/lib/weather-display
+The feed arrives unexpanded, so recurrence is worked out locally by `ics.py`:
+`DAILY`, `WEEKLY` (with `BYDAY`), `MONTHLY` and `YEARLY`, plus `INTERVAL`,
+`COUNT`, `UNTIL`, `WKST`, `EXDATE`, and single instances that were moved or
+cancelled. A rule outside that set shows up only on its first date, which errs
+towards too little on the panel rather than towards a wrong date.
 
-sudo install -o root -g weather -m 640 .env.example /opt/weather-display/.env
+Two alternatives, if you need them:
 
-sudoedit /etc/weather-display/config.json    # set your city and coordinates
-sudoedit /opt/weather-display/.env           # calendar ID, if you want events
-```
-
-`.env` is read from beside `weather.py`, which is `/opt/weather-display` — the
-service's `WorkingDirectory`, so it is found either way. Mode `640`,
-`root:weather`, because it may hold a refresh token.
-
-Point `output` at the directory the web server serves:
-
-```json
-{
-  "output": "/var/lib/weather-display/www/weather-script-output.png",
-  "cache":  "/var/lib/weather-display/last-forecast.json"
-}
-```
-
-Then enable the renderer, its timer, and the tiny file server:
-
-```sh
-sudo cp systemd/* /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now weather-display.timer weather-http.service
-sudo systemctl start weather-display.service     # render one now
-journalctl -u weather-display.service -n 20
-```
-
-`weather-http.service` is `python3 -m http.server` bound to the LAN on port
-8080 — no nginx needed for one Kindle fetching one PNG. If you already run a
-web server, drop that unit and point `output` into its document root instead.
-
-Allow the port if the Pi is running a firewall:
-
-```sh
-sudo ufw allow from 192.168.0.0/16 to any port 8080 proto tcp
-```
-
-There are two schedules, on two machines, and they are independent: this timer
-renders the PNG on the Pi, and a cron job **on the Kindle** fetches and draws it
-(see [On the Kindle](#on-the-kindle)). Offsetting the Kindle a couple of minutes
-— `2,17,32,47 * * * *` — has it fetch just after a fresh render rather than
-racing one.
-
-### Where the image ends up
-
-Wherever `output` points, and nowhere else:
-
-| running | `output` | the PNG lands |
+| you want | set in `.env` | cost |
 |---|---|---|
-| by hand, from the repo | `preview.png` | in whatever directory you ran from |
-| on the Pi | `/var/lib/weather-display/www/weather-script-output.png` | served at `http://<pi>:8080/weather-script-output.png` |
+| the same public calendar, but Google expands recurrence | `CALENDAR_API_KEY` + `CALENDAR_ID` | a Cloud project and an API key |
+| a **private** calendar | `CALENDAR_CLIENT_ID`, `_SECRET`, `_REFRESH_TOKEN` | one-time consent via `gcal_setup.py` |
 
-A relative path really does follow the working directory, so use an absolute one
-on the Pi, where systemd or cron picks the cwd rather than you. Two constraints
-on it: the **filename** must stay `weather-script-output.png`, because that is
-what the Kindle script asks for, and the **directory** must be the one
-`weather-http.service` serves. Missing directories are created.
+A static API key only ever reaches public data, so the second row is the only
+way to read a private calendar. Watch its consent screen: an **External** app
+left in **Testing** is issued refresh tokens that expire after 7 days, and the
+symptom is a band that goes blank every week for no reason. Set it to **In
+production**.
 
-### If you'd rather use cron
+The API itself is free either way — a million requests a day per project, no
+billing account — and a render every half hour uses about 48. (Maps Platform is
+the opposite deal, which is where the worry usually comes from: it requires
+billing but does accept a static key.)
 
-The timer is the better fit on the Pi — it survives reboots, catches up after
-downtime, and logs to the journal — but a crontab line works:
+Whichever route, the calendar is strictly an extra. A Google outage, a bad key
+or an expired token is caught, logged to stderr, and falls back to the events
+cached from the last successful render; the weather draws regardless.
 
-```cron
-*/15 * * * * /usr/bin/python3 /opt/weather-display/weather.py --config /etc/weather-display/config.json >> /var/log/weather-display.log 2>&1
-```
+## The cat
 
-Install it for the `weather` user, not root: `sudo crontab -u weather -e`.
+The left column holds a random PNG from `cat/`, picked fresh on every render.
+It is pure decoration and every failure in it is swallowed — a missing
+directory or an unreadable file costs you the cat, never the weather.
 
-Three things cron will bite you with, all avoided by the line above. Absolute
-paths for both the interpreter and the script, because cron's `PATH` is nearly
-empty. Redirect output somewhere, or every stderr line (`calendar unavailable`,
-and so on) becomes mail you never read. And if you run from a virtualenv, name
-its interpreter directly — `/path/to/venv/bin/python3` — rather than trying to
-activate anything.
+Two things happen to each image on the way in. Its transparent margin is
+trimmed first, so cats of different shapes (one stretching, one scratching) each
+fill the column by their own proportions instead of by the padding in their
+square canvas. Then it is flattened onto white *before* dropping to 8-bit grey:
+converting RGBA straight to `"L"` reads fully transparent pixels as black and
+boxes the cat in.
 
-The working directory does not matter: `.env` is read from beside `weather.py`,
-and `output` and `cache` should be absolute paths anyway.
+Drop your own PNGs in `cat/` and they join the rotation. `.gitignore` ignores
+generated `*.png` but re-includes `cat/*.png`, so artwork is tracked and output
+is not.
 
-## On the Kindle
+Making room for this is what moved the day's high and low up into the header,
+which in turn freed the space above the bars for the weather icons. The whole
+vertical budget is named at the top of `render.py` (`BODY_LIMIT`, `CHART_RULE`,
+`ICON_ROW`, `BAR_TOP` …) so it can be audited in one place rather than chased
+through magic numbers.
 
-Unzip `../kindleweatherfiles.zip` to the Kindle root as before, then replace
-`/mnt/us/weather/display-weather.sh` with `kindle/display-weather.sh` and set
-`HOST` to your Pi. Give the Pi a static DHCP lease so the URL stays valid.
+## When the network is down
 
-Then give it a cron job — the Kindle has no systemd, so this one really is cron:
+A failed fetch retries three times with backoff, then falls back to the cached
+payload and marks the header `Offline - data from 8:08 PM`, so a flaky wifi
+moment leaves a slightly stale display rather than a blank one. If there is no
+usable cache, or the cache is too old to cover today, the script exits non-zero
+and leaves the previous image in place — the Kindle keeps showing the last good
+render. The PNG is written to a temp file and renamed into place, so the Kindle
+can never fetch a half-written image.
 
-```cron
-2,17,32,47 * * * * /mnt/us/weather/display-weather.sh
-```
+## Newer Kindles
 
-Under busybox crond that is `crontab -e`, though on many jailbroken models it is
-backed by `/etc/crontab/root`; either way the rootfs is mounted read-only, so
-`mntroot rw` first if you are editing outside `/mnt/us`.
-
-The copy here also fixes a typo in the original: its retry branch fetched
-`weather-script.output.png` (a dot instead of a dash), so the second attempt
-could never display anything.
-
-### Newer Kindles
-
-The zip at `../kindleweatherfiles.zip` is the original 2016 package and has not
-been repackaged: its `display-weather.sh` still points at the author's old EC2
-address and still carries the retry typo, which is why the instructions above
-replace it with `kindle/display-weather.sh`. Its `weather-image-error.png` is
-600x800, matching the Kindle 4 / Touch / Paperwhite 1 this was built for.
+The Kindle payload here was built for the 600x800 panel of a Kindle 4 / Touch /
+Paperwhite 1 — which is what `weather-image-error.png` still is.
 
 The mechanism — `eips` to draw, `stop framework` to keep the reader UI off the
 screen, cron to repeat — is still how these dashboards are built on current
@@ -401,59 +473,6 @@ the height. Common panels, landscape:
 | Paperwhite 3 / 4, Oasis 2 | `1448`, `1072` |
 | Paperwhite 5 / Colorsoft, Oasis 3 | `1648`, `1236` |
 | Scribe | `2480`, `1860` |
-
-## Configuration
-
-All keys are optional; defaults are in `DEFAULTS` at the top of `weather.py`.
-
-| key | default | meaning |
-|---|---|---|
-| `city` | `Manila` | shown in the header |
-| `latitude`, `longitude` | Manila | forecast location |
-| `timezone` | `Asia/Manila` | an [IANA name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones); all times shown are local to this |
-| `output` | `weather-script-output.png` | where the PNG is written, atomically |
-| `cache` | `last-forecast.json` | last good payload, for offline fallback |
-| `display_units` | `metric` | `imperial` switches to °F and mph |
-| `width`, `height` | `800`, `600` | canvas before rotation; see [Newer Kindles](#newer-kindles) before changing |
-| `rotate` | `90` | degrees clockwise; `0` gives the landscape original |
-| `day_start_hour`, `day_end_hour` | `6`, `21` | hours that can produce an advisory |
-| `commutes` | `[[7,9],[17,19]]` | hour ranges that score higher |
-| `max_advisories` | `3` | lines of advice |
-| `greys` | `16` | grey levels; `0` disables posterising |
-| `cat_dir` | `./cat` | a random `.png` from here fills the left column; `null` for none |
-| `calendar` | `null` | `{"max_events": 2}`; the ID itself goes in `.env` — see [The calendar](#the-calendar) |
-| `fonts` | DejaVu, auto-detected | `{"regular": "...", "bold": "..."}` |
-
-## Running it by hand
-
-```sh
-./weather.py --dry-run                    # print the summary, draw nothing
-./weather.py --config config.json         # normal run
-./weather.py --output /tmp/preview.png    # override the destination
-./weather.py --fixture saved.json         # render a saved API payload
-```
-
-`--dry-run` needs no Pillow, which makes it a quick way to sanity-check
-thresholds over SSH:
-
-```
-Manila  Mon 31 Aug 20:07
-  high 31°  low 26°
-  Rain on and off
-  - Light rain 6am-12pm - bring an umbrella   (rain, severity 55)
-  - Thunderstorms 8-9am - stay indoors if you can   (thunder, severity 100)
-  - Strong gusts at 3pm, 71 km/h - an umbrella will flip   (wind, severity 65)
-```
-
-## When the network is down
-
-A failed fetch retries three times with backoff, then falls back to the cached
-payload and marks the header `Offline - data from 8:08 PM`, so a flaky wifi
-moment leaves a slightly stale display rather than a blank one. If there is no
-usable cache, or the cache is too old to cover today, the script exits non-zero
-and leaves the previous image in place — the Kindle keeps showing the last good
-render. The PNG is written to a temp file and renamed into place, so the Kindle
-can never fetch a half-written image.
 
 ## Tests
 
@@ -481,4 +500,14 @@ python3 -m unittest discover -s . -v     # 74 tests
 | `.env.example` | template for the calendar ID and any credentials |
 | `cat/` | decorative cat PNGs, one picked at random per render |
 | `systemd/` | render timer and LAN file server |
-| `kindle/` | client-side fetch and display script |
+| `kindle/` | everything that goes on the Kindle, laid out as `/mnt/us` |
+| `kindle/weather/display-weather.sh` | fetch and draw, run from the Kindle's cron |
+| `kindle/weather/weather-image-error.png` | shown when the server is unreachable |
+| `kindle/WIFI_NO_NET_PROBE` | keeps wifi up on a LAN with no internet |
+
+---
+
+The Kindle-side script descends from
+[yoonsikp/weather-display](https://github.com/yoonsikp/weather-display), with
+the hardcoded server address, a missing download check, and a typo that made its
+retry branch useless all fixed.
