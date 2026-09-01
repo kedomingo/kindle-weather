@@ -1,0 +1,5 @@
+# Pillow does the drawing; python-dotenv keeps the calendar ID and any
+# credentials in .env instead of in a config file you might commit.
+# Everything else is the Python standard library.
+Pillow>=9.0
+python-dotenv>=0.19

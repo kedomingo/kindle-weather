@@ -1,0 +1,21 @@
+{
+  "city": "Manila",
+  "latitude": 14.5995,
+  "longitude": 120.9842,
+  "timezone": "Asia/Manila",
+
+  "output": "/var/lib/weather-display/www/weather-script-output.png",
+  "cache": "/var/lib/weather-display/last-forecast.json",
+
+  "display_units": "metric",
+  "rotate": 90,
+
+  "cat_dir": "/opt/weather-display/cat",
+
+  "calendar": { "max_events": 2 },
+
+  "day_start_hour": 6,
+  "day_end_hour": 21,
+  "commutes": [[7, 9], [17, 19]],
+  "max_advisories": 3
+}

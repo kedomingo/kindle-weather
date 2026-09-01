@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the Kindle weather image every 15 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15min
+# Catch up after the Pi has been asleep or offline.
+Persistent=true
+# Stagger slightly so every device on the network is not hitting the API at :00.
+RandomizedDelaySec=60
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

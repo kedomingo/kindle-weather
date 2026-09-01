@@ -1,0 +1,18 @@
+[Unit]
+Description=Render the Kindle weather image
+Documentation=https://github.com/yoonsikp/weather-display
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=weather
+Group=weather
+WorkingDirectory=/opt/weather-display
+ExecStart=/usr/bin/python3 /opt/weather-display/weather.py --config /etc/weather-display/config.json
+# The image and cache directories are the only places this needs to write.
+ReadWritePaths=/var/lib/weather-display
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

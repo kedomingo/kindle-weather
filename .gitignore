@@ -1,0 +1,15 @@
+.DS_Store
+.omc
+.idea
+
+venv/
+last-forecast.json
+__pycache__/
+
+# Secrets and whatever this machine happens to be configured as.
+.env
+local.json
+
+# Generated output, but not the artwork that goes into it.
+*.png
+!cat/*.png
