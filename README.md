@@ -114,6 +114,12 @@ Confirm `http://<server>:8080/weather-script-output.png` loads from another
 machine before moving on, and give the server a static DHCP lease so that URL
 keeps working.
 
+If 8080 is taken, change it with `sudo systemctl edit weather-http.service` (an
+empty `ExecStart=` first, then the real one) rather than by editing the shipped
+unit, which a later `cp systemd/*` would overwrite. The port also appears in the
+`ufw` rule above and in `HOST` in the Kindle's `display-weather.sh` — all three
+have to agree, and a mismatch shows up only as the error image.
+
 <details>
 <summary>No systemd? Use cron instead.</summary>
 
@@ -163,17 +169,60 @@ kindle/weather/display-weather.sh      ->  /mnt/us/weather/display-weather.sh
 kindle/weather/weather-image-error.png ->  /mnt/us/weather/weather-image-error.png
 ```
 
-Set `HOST` at the top of `display-weather.sh` to your server, then give the
-Kindle a cron job — it has no systemd, so this one really is cron:
+Set `HOST` at the top of `display-weather.sh` to your server — that is the only
+edit needed on this side.
+
+**Get a shell.** The cron job lives outside `/mnt/us`, so it has to be installed
+over SSH. On a jailbroken Kindle that means
+[USBNetwork](https://wiki.mobileread.com/wiki/Kindle4NTHacking#USBNetworking):
+install it through *KUAL → Helper → Install MR Packages*, then type `;un` in the
+Kindle's search bar to start it (`;uns` stops it). The Kindle appears at
+`192.168.15.244`, so give your computer's new USB ethernet interface
+`192.168.15.201/24` and:
+
+```sh
+ssh root@192.168.15.244        # no password on a fresh USBNetwork install
+```
+
+Two things worth doing straight away, both from that shell:
+
+```sh
+passwd                                    # sshd is open until you set one
+echo "USE_WIFI=true" >> /mnt/us/usbnet/etc/config    # then ssh over the LAN instead
+touch /mnt/us/usbnet/auto                 # start sshd on every boot
+```
+
+Do this **before** you run `display-weather.sh`, not after: the script stops
+`framework`, and with the reader UI gone there is no search bar left to type
+`;un` into. If you skip `auto` and get locked out, a reboot brings the UI back.
+
+**Install the cron job.** The Kindle has no systemd, so this one really is cron
+— busybox crond, reading `/etc/crontab/root` on the read-only rootfs:
+
+```sh
+mntroot rw
+vi /etc/crontab/root
+```
 
 ```cron
 2,17,32,47 * * * * /mnt/us/weather/display-weather.sh
 ```
 
-Under busybox crond that is `crontab -e`, though on many jailbroken models it is
-backed by `/etc/crontab/root`; either way the rootfs is mounted read-only, so
-`mntroot rw` first if you edit outside `/mnt/us`. The two-minute offset has the
-Kindle fetch just after a fresh render rather than racing one.
+```sh
+/etc/init.d/cron restart
+mntroot ro                     # leave it read-only again
+```
+
+The two-minute offset has the Kindle fetch just after a fresh render rather than
+racing one. Test the script by hand before trusting the schedule:
+
+```sh
+/mnt/us/weather/display-weather.sh
+```
+
+If that answers `permission denied`, invoke it through the shell instead —
+`/mnt/us` is a FAT volume and carries no reliable exec bit — by making the cron
+line `2,17,32,47 * * * * /bin/sh /mnt/us/weather/display-weather.sh`.
 
 What each file does:
 
